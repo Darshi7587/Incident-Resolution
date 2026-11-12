@@ -1,4 +1,4 @@
-"""LangGraph StateGraph workflow and shared IncidentState for multi-agent orchestration."""
+"""LangGraph StateGraph workflows and shared IncidentState for multi-agent orchestration."""
 
 from __future__ import annotations
 
@@ -10,9 +10,11 @@ from sqlalchemy.orm import Session
 from backend.agents.log_agent import LogAnalysisAgent
 from backend.agents.monitoring_agent import MonitoringAgent
 from backend.agents.rag_agent import RAGKnowledgeAgent
+from backend.agents.remediation_agent import RemediationPlanningAgent
 from backend.agents.root_cause_agent import RootCauseAnalysisAgent
 from backend.config import Settings, get_settings
 from backend.services.incident_simulator import SimulatedInfrastructure
+from backend.services.remediation_executor import RemediationExecutor
 
 
 class IncidentState(TypedDict, total=False):
@@ -36,20 +38,26 @@ class IncidentState(TypedDict, total=False):
     validation_result: Dict[str, Any]
 
     # Control / Routing
-    workflow_status: str  # INVESTIGATING, INVESTIGATED, AWAITING_APPROVAL, EXECUTED, RESOLVED, FAILED, ESCALATED, NO_INCIDENT
+    workflow_status: str  # INVESTIGATING, AWAITING_APPROVAL, EXECUTED, REMEDIATION_FAILED, RESOLVED, FAILED, ESCALATED, NO_INCIDENT
     should_continue: bool
     escalation_reason: Optional[str]
     error_message: Optional[str]
     events: List[Dict[str, str]]
 
 
-def build_investigation_graph(
+def _append_event(state: IncidentState, agent: str, status: str, detail: str) -> List[Dict[str, str]]:
+    events = list(state.get("events", []))
+    events.append({"agent": agent, "status": status, "detail": detail})
+    return events
+
+
+def build_incident_graph(
     db: Optional[Session] = None,
     settings: Optional[Settings] = None,
     infra: Optional[SimulatedInfrastructure] = None,
     rag_min_relevance: float = 0.25,
 ):
-    """Build and compile the LangGraph StateGraph for multi-agent incident investigation."""
+    """Build and compile the LangGraph StateGraph from triage through remediation/approval gate."""
     cfg = settings or get_settings()
     infrastructure = infra or SimulatedInfrastructure()
 
@@ -57,11 +65,8 @@ def build_investigation_graph(
     log_agent = LogAnalysisAgent()
     rca_agent = RootCauseAnalysisAgent(settings=cfg)
     rag_agent = RAGKnowledgeAgent(settings=cfg)
-
-    def _append_event(state: IncidentState, agent: str, status: str, detail: str) -> List[Dict[str, str]]:
-        events = list(state.get("events", []))
-        events.append({"agent": agent, "status": status, "detail": detail})
-        return events
+    remediation_agent = RemediationPlanningAgent(settings=cfg)
+    executor = RemediationExecutor(infra=infrastructure)
 
     def node_monitoring(state: IncidentState) -> Dict[str, Any]:
         try:
@@ -99,12 +104,7 @@ def build_investigation_graph(
             )
             return {
                 "log_result": res,
-                "events": _append_event(
-                    state,
-                    log_agent.name,
-                    "COMPLETED",
-                    res["summary"],
-                ),
+                "events": _append_event(state, log_agent.name, "COMPLETED", res["summary"]),
             }
         except Exception as exc:
             return {
@@ -191,12 +191,7 @@ def build_investigation_graph(
             )
             return {
                 "rag_result": res,
-                "events": _append_event(
-                    state,
-                    rag_agent.name,
-                    "COMPLETED",
-                    res["summary"],
-                ),
+                "events": _append_event(state, rag_agent.name, "COMPLETED", res["summary"]),
             }
         except Exception as exc:
             return {
@@ -212,7 +207,7 @@ def build_investigation_graph(
         rag = state.get("rag_result", {})
         if not rag.get("evidence_found", False):
             return "escalate_missing_runbook"
-        return "complete_investigation"
+        return "plan_remediation"
 
     def node_escalate_missing_runbook(state: IncidentState) -> Dict[str, Any]:
         reason = "No matching runbook evidence found in ChromaDB; escalated to human SRE."
@@ -223,14 +218,78 @@ def build_investigation_graph(
             "events": _append_event(state, "Orchestrator Agent", "ESCALATED", reason),
         }
 
-    def node_complete_investigation(state: IncidentState) -> Dict[str, Any]:
+    def node_remediation_planning(state: IncidentState) -> Dict[str, Any]:
+        try:
+            plan = remediation_agent.plan(
+                incident_id=state["incident_id"],
+                incident_type=state.get("incident_type", "unknown"),
+                affected_service=state.get("affected_service", "unknown"),
+                rca_result=state.get("rca_result", {}),
+                rag_result=state.get("rag_result", {}),
+                before_metrics=state.get("metrics_snapshot"),
+                db=db,
+            )
+            return {
+                "remediation_plan": plan,
+                "events": _append_event(
+                    state,
+                    remediation_agent.name,
+                    "COMPLETED",
+                    f"Proposed {plan['action_name']} (risk={plan['risk_level']}, approval_required={plan['requires_approval']})",
+                ),
+            }
+        except Exception as exc:
+            return {
+                "workflow_status": "FAILED",
+                "should_continue": False,
+                "error_message": f"Remediation Planning Agent failed: {exc}",
+                "events": _append_event(state, remediation_agent.name, "FAILED", str(exc)),
+            }
+
+    def route_after_planning(state: IncidentState) -> str:
+        if not state.get("should_continue", True):
+            return "stop_failed"
+        plan = state.get("remediation_plan", {})
+        if plan.get("requires_approval", True):
+            return "pause_for_approval"
+        return "execute_remediation"
+
+    def node_pause_for_approval(state: IncidentState) -> Dict[str, Any]:
+        plan = state.get("remediation_plan", {})
         return {
-            "workflow_status": "INVESTIGATED",
+            "workflow_status": "AWAITING_APPROVAL",
+            "should_continue": False,
             "events": _append_event(
                 state,
-                "Orchestrator Agent",
-                "COMPLETED",
-                "Investigation stage completed (Monitoring, Logs, RCA, RAG).",
+                "Risk Engine",
+                "AWAITING_APPROVAL",
+                f"Paused workflow for human approval ({plan.get('approval_id')}) on {plan.get('action_name')}.",
+            ),
+        }
+
+    def node_execute_remediation(state: IncidentState) -> Dict[str, Any]:
+        plan = state.get("remediation_plan", {})
+        approval_res = state.get("approval_result", {})
+        approval_status = approval_res.get("status") or plan.get("approval_status", "PENDING")
+
+        exec_res = executor.execute_action(
+            action_name=plan["action_name"],
+            target_service=plan["target_service"],
+            approval_status=approval_status,
+            simulate_failure=bool(state.get("simulate_failure", False)),
+            action_id=plan.get("action_id"),
+            incident_id=state["incident_id"],
+            db=db,
+        )
+        next_status = "EXECUTED" if exec_res["action_succeeded"] else "REMEDIATION_FAILED"
+        return {
+            "execution_result": exec_res,
+            "workflow_status": next_status,
+            "events": _append_event(
+                state,
+                "Remediation Executor",
+                exec_res["execution_status"],
+                exec_res["message"],
             ),
         }
 
@@ -242,7 +301,9 @@ def build_investigation_graph(
     graph.add_node("root_cause", node_root_cause)
     graph.add_node("rag_retrieval", node_rag_retrieval)
     graph.add_node("escalate_missing_runbook", node_escalate_missing_runbook)
-    graph.add_node("complete_investigation", node_complete_investigation)
+    graph.add_node("remediation_planning", node_remediation_planning)
+    graph.add_node("pause_for_approval", node_pause_for_approval)
+    graph.add_node("execute_remediation", node_execute_remediation)
 
     graph.set_entry_point("monitoring")
     graph.add_edge("monitoring", "log_analysis")
@@ -264,10 +325,71 @@ def build_investigation_graph(
         {
             "stop_failed": "stop_failed",
             "escalate_missing_runbook": "escalate_missing_runbook",
-            "complete_investigation": "complete_investigation",
+            "plan_remediation": "remediation_planning",
         },
     )
     graph.add_edge("escalate_missing_runbook", END)
-    graph.add_edge("complete_investigation", END)
+    graph.add_conditional_edges(
+        "remediation_planning",
+        route_after_planning,
+        {
+            "stop_failed": "stop_failed",
+            "pause_for_approval": "pause_for_approval",
+            "execute_remediation": "execute_remediation",
+        },
+    )
+    graph.add_edge("pause_for_approval", END)
+    graph.add_edge("execute_remediation", END)
 
     return graph.compile()
+
+
+def build_resume_graph(
+    db: Optional[Session] = None,
+    infra: Optional[SimulatedInfrastructure] = None,
+):
+    """Build LangGraph StateGraph to resume paused workflow after human approval."""
+    infrastructure = infra or SimulatedInfrastructure()
+    executor = RemediationExecutor(infra=infrastructure)
+
+    def node_execute_approved(state: IncidentState) -> Dict[str, Any]:
+        plan = state.get("remediation_plan", {})
+        approval_res = state.get("approval_result", {})
+        if approval_res.get("status") != "APPROVED":
+            reason = "Workflow resumed without APPROVED status; refusing remediation execution."
+            return {
+                "workflow_status": "ESCALATED",
+                "escalation_reason": reason,
+                "events": _append_event(state, "Orchestrator Agent", "BLOCKED", reason),
+            }
+
+        exec_res = executor.execute_action(
+            action_name=plan["action_name"],
+            target_service=plan["target_service"],
+            approval_status="APPROVED",
+            simulate_failure=bool(state.get("simulate_failure", False)),
+            action_id=plan.get("action_id"),
+            incident_id=state["incident_id"],
+            db=db,
+        )
+        next_status = "EXECUTED" if exec_res["action_succeeded"] else "REMEDIATION_FAILED"
+        return {
+            "execution_result": exec_res,
+            "workflow_status": next_status,
+            "events": _append_event(
+                state,
+                "Remediation Executor",
+                exec_res["execution_status"],
+                exec_res["message"],
+            ),
+        }
+
+    graph = StateGraph(IncidentState)
+    graph.add_node("execute_approved", node_execute_approved)
+    graph.set_entry_point("execute_approved")
+    graph.add_edge("execute_approved", END)
+    return graph.compile()
+
+
+# Backwards-compatible alias for Phase 6 imports
+build_investigation_graph = build_incident_graph
