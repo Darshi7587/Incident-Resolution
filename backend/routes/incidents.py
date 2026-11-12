@@ -6,8 +6,9 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from backend.agents.orchestrator import OrchestratorAgent
 from backend.database.db import get_db
-from backend.database.models import Incident
+from backend.database.models import AgentExecution, Incident
 from backend.schemas.incident import (
     IncidentDetailResponse,
     IncidentResponse,
@@ -67,7 +68,57 @@ def simulate_incident(
         scenario=payload.scenario,
         simulate_failure=payload.simulate_failure,
     )
+    if payload.auto_process:
+        orchestrator = OrchestratorAgent(infra=simulator.infra)
+        orchestrator.process_incident(db=db, incident_id=incident.id)
+        db.refresh(incident)
     return _to_incident_detail(incident)
+
+
+@router.post("/incidents/{incident_id}/process")
+def process_incident(incident_id: str, db: Session = Depends(get_db)):
+    """Run the LangGraph multi-agent workflow for a given incident."""
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail=f"Incident '{incident_id}' not found")
+    orchestrator = OrchestratorAgent()
+    state = orchestrator.process_incident(db=db, incident_id=incident_id)
+    db.refresh(incident)
+    return {
+        "incident_id": incident.id,
+        "status": incident.status,
+        "severity": incident.severity,
+        "workflow_state": state,
+    }
+
+
+@router.get("/incidents/{incident_id}/timeline")
+def get_incident_timeline(incident_id: str, db: Session = Depends(get_db)):
+    """Return chronological agent execution events stored in SQLite."""
+    incident = db.query(Incident).filter(Incident.id == incident_id).first()
+    if not incident:
+        raise HTTPException(status_code=404, detail=f"Incident '{incident_id}' not found")
+    executions = (
+        db.query(AgentExecution)
+        .filter(AgentExecution.incident_id == incident_id)
+        .order_by(AgentExecution.executed_at.asc(), AgentExecution.id.asc())
+        .all()
+    )
+    return {
+        "incident_id": incident_id,
+        "events": [
+            {
+                "id": ex.id,
+                "timestamp": ex.executed_at.isoformat(),
+                "agent_name": ex.agent_name,
+                "status": ex.status,
+                "message": ex.message,
+                "input_summary": json.loads(ex.input_summary or "{}"),
+                "output_summary": json.loads(ex.output_summary or "{}"),
+            }
+            for ex in executions
+        ],
+    }
 
 
 @router.get("/incidents", response_model=List[IncidentResponse])
