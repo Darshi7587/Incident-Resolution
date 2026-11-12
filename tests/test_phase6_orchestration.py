@@ -32,10 +32,10 @@ def test_orchestrator_langgraph_routes_and_timeline(tmp_path, monkeypatch):
 
     SessionLocal = get_session_factory()
     with SessionLocal() as db:
-        # 1. High CPU full investigation
+        # 1. High CPU full investigation -> pauses at remediation approval gate
         inc_cpu = sim.generate_incident(db=db, scenario=ScenarioType.HIGH_CPU)
         state_cpu = orch.process_incident(db=db, incident_id=inc_cpu.id)
-        assert state_cpu["workflow_status"] == "INVESTIGATED"
+        assert state_cpu["workflow_status"] == "AWAITING_APPROVAL"
         assert state_cpu["monitoring_result"]["severity"] == "CRITICAL"
         assert state_cpu["rag_result"]["primary_runbook"] == "cpu_high.md"
 
@@ -64,7 +64,7 @@ def test_orchestrator_langgraph_routes_and_timeline(tmp_path, monkeypatch):
             r_proc = await client.post(f"/incidents/{inc_id}/process")
             assert r_proc.status_code == 200
             proc_data = r_proc.json()
-            assert proc_data["status"] == "INVESTIGATED"
+            assert proc_data["status"] == "AWAITING_APPROVAL"
             assert proc_data["workflow_state"]["rag_result"]["primary_runbook"] == "service_failure.md"
 
             r_time = await client.get(f"/incidents/{inc_id}/timeline")
