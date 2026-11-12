@@ -189,7 +189,7 @@ class OrchestratorAgent:
         }
         saved_state["should_continue"] = True
 
-        resume_graph = build_resume_graph(db=db, infra=self.infra)
+        resume_graph = build_resume_graph(db=db, settings=self.settings, infra=self.infra)
         resumed_state = resume_graph.invoke(saved_state)
 
         final_status = resumed_state.get("workflow_status", "EXECUTED")

@@ -86,10 +86,10 @@ def test_persistent_approval_approve_and_reject_workflows(tmp_path, monkeypatch)
 
     SessionLocal = get_session_factory()
     with SessionLocal() as db:
-        # 1. Disk Full (LOW risk) -> auto-approved and executed immediately
+        # 1. Disk Full (LOW risk) -> auto-approved, executed, and validated as RESOLVED
         inc_disk = sim.generate_incident(db=db, scenario=ScenarioType.DISK_FULL)
         state_disk = orch.process_incident(db=db, incident_id=inc_disk.id)
-        assert state_disk["workflow_status"] == "EXECUTED"
+        assert state_disk["workflow_status"] == "RESOLVED"
         assert state_disk["remediation_plan"]["risk_level"] == "LOW"
         assert infra.get_system_metrics()["disk_usage"] == 54.0
 
@@ -117,7 +117,7 @@ def test_persistent_approval_approve_and_reject_workflows(tmp_path, monkeypatch)
 
         app_res = orch.approve_and_resume(db=db, approval_id=cpu_approval_id, decided_by="oncall-eng", comment="Approved restart")
         assert app_res["approval"].status == "APPROVED"
-        assert app_res["incident"].status == "EXECUTED"
+        assert app_res["incident"].status == "RESOLVED"
         assert infra.get_system_metrics()["cpu_usage"] == 26.0
         assert infra.get_system_metrics()["services"]["application-server"] == "HEALTHY"
 

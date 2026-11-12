@@ -3,7 +3,8 @@
 import json
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
 from backend.agents.orchestrator import OrchestratorAgent
@@ -15,6 +16,7 @@ from backend.schemas.incident import (
     SimulateIncidentRequest,
     SystemMetricsResponse,
 )
+from backend.services.audit_service import build_incident_report, render_report_text
 from backend.services.incident_simulator import IncidentSimulator, SimulatedInfrastructure
 
 router = APIRouter(tags=["Incidents & Simulator"])
@@ -119,6 +121,21 @@ def get_incident_timeline(incident_id: str, db: Session = Depends(get_db)):
             for ex in executions
         ],
     }
+
+
+@router.get("/incidents/{incident_id}/report")
+def get_incident_report(
+    incident_id: str,
+    format: str = Query(default="json", pattern="^(json|text)$"),
+    db: Session = Depends(get_db),
+):
+    """Generate an auditable incident resolution report in JSON or plain-text format."""
+    report = build_incident_report(db=db, incident_id=incident_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail=f"Incident '{incident_id}' not found")
+    if format == "text":
+        return PlainTextResponse(content=render_report_text(report), media_type="text/plain")
+    return report
 
 
 @router.get("/incidents", response_model=List[IncidentResponse])

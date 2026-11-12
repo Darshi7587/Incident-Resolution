@@ -12,6 +12,7 @@ from backend.agents.monitoring_agent import MonitoringAgent
 from backend.agents.rag_agent import RAGKnowledgeAgent
 from backend.agents.remediation_agent import RemediationPlanningAgent
 from backend.agents.root_cause_agent import RootCauseAnalysisAgent
+from backend.agents.validation_agent import ValidationAgent
 from backend.config import Settings, get_settings
 from backend.services.incident_simulator import SimulatedInfrastructure
 from backend.services.remediation_executor import RemediationExecutor
@@ -67,6 +68,7 @@ def build_incident_graph(
     rag_agent = RAGKnowledgeAgent(settings=cfg)
     remediation_agent = RemediationPlanningAgent(settings=cfg)
     executor = RemediationExecutor(infra=infrastructure)
+    validation_agent = ValidationAgent(settings=cfg, infra=infrastructure)
 
     def node_monitoring(state: IncidentState) -> Dict[str, Any]:
         try:
@@ -293,6 +295,26 @@ def build_incident_graph(
             ),
         }
 
+    def node_validate_recovery(state: IncidentState) -> Dict[str, Any]:
+        plan = state.get("remediation_plan", {})
+        val_res = validation_agent.validate(
+            incident_id=state["incident_id"],
+            target_service=plan.get("target_service", state.get("affected_service", "unknown")),
+            before_metrics=state.get("metrics_snapshot", {}),
+            execution_result=state.get("execution_result", {}),
+            db=db,
+        )
+        return {
+            "validation_result": val_res,
+            "workflow_status": val_res["final_status"],
+            "events": _append_event(
+                state,
+                validation_agent.name,
+                val_res["final_status"],
+                val_res["validation_notes"],
+            ),
+        }
+
     graph = StateGraph(IncidentState)
     graph.add_node("monitoring", node_monitoring)
     graph.add_node("log_analysis", node_log_analysis)
@@ -304,6 +326,7 @@ def build_incident_graph(
     graph.add_node("remediation_planning", node_remediation_planning)
     graph.add_node("pause_for_approval", node_pause_for_approval)
     graph.add_node("execute_remediation", node_execute_remediation)
+    graph.add_node("validate_recovery", node_validate_recovery)
 
     graph.set_entry_point("monitoring")
     graph.add_edge("monitoring", "log_analysis")
@@ -339,18 +362,22 @@ def build_incident_graph(
         },
     )
     graph.add_edge("pause_for_approval", END)
-    graph.add_edge("execute_remediation", END)
+    graph.add_edge("execute_remediation", "validate_recovery")
+    graph.add_edge("validate_recovery", END)
 
     return graph.compile()
 
 
 def build_resume_graph(
     db: Optional[Session] = None,
+    settings: Optional[Settings] = None,
     infra: Optional[SimulatedInfrastructure] = None,
 ):
     """Build LangGraph StateGraph to resume paused workflow after human approval."""
+    cfg = settings or get_settings()
     infrastructure = infra or SimulatedInfrastructure()
     executor = RemediationExecutor(infra=infrastructure)
+    validation_agent = ValidationAgent(settings=cfg, infra=infrastructure)
 
     def node_execute_approved(state: IncidentState) -> Dict[str, Any]:
         plan = state.get("remediation_plan", {})
@@ -359,6 +386,7 @@ def build_resume_graph(
             reason = "Workflow resumed without APPROVED status; refusing remediation execution."
             return {
                 "workflow_status": "ESCALATED",
+                "should_continue": False,
                 "escalation_reason": reason,
                 "events": _append_event(state, "Orchestrator Agent", "BLOCKED", reason),
             }
@@ -376,6 +404,7 @@ def build_resume_graph(
         return {
             "execution_result": exec_res,
             "workflow_status": next_status,
+            "should_continue": True,
             "events": _append_event(
                 state,
                 "Remediation Executor",
@@ -384,10 +413,44 @@ def build_resume_graph(
             ),
         }
 
+    def route_after_resume_exec(state: IncidentState) -> str:
+        if not state.get("should_continue", True):
+            return "end_blocked"
+        return "validate_recovery"
+
+    def node_validate_recovery(state: IncidentState) -> Dict[str, Any]:
+        plan = state.get("remediation_plan", {})
+        val_res = validation_agent.validate(
+            incident_id=state["incident_id"],
+            target_service=plan.get("target_service", state.get("affected_service", "unknown")),
+            before_metrics=state.get("metrics_snapshot", {}),
+            execution_result=state.get("execution_result", {}),
+            db=db,
+        )
+        return {
+            "validation_result": val_res,
+            "workflow_status": val_res["final_status"],
+            "events": _append_event(
+                state,
+                validation_agent.name,
+                val_res["final_status"],
+                val_res["validation_notes"],
+            ),
+        }
+
     graph = StateGraph(IncidentState)
     graph.add_node("execute_approved", node_execute_approved)
+    graph.add_node("validate_recovery", node_validate_recovery)
     graph.set_entry_point("execute_approved")
-    graph.add_edge("execute_approved", END)
+    graph.add_conditional_edges(
+        "execute_approved",
+        route_after_resume_exec,
+        {
+            "end_blocked": END,
+            "validate_recovery": "validate_recovery",
+        },
+    )
+    graph.add_edge("validate_recovery", END)
     return graph.compile()
 
 
