@@ -1,0 +1,5 @@
+[10:00:01] INFO application-server CPU utilization: 45%
+[10:00:02] WARNING application-server CPU utilization: 72%
+[10:00:03] CRITICAL application-server CPU utilization: 95%
+[10:00:04] ERROR application-server CPU_THRESHOLD_EXCEEDED: runaway worker thread pool (pid=4821)
+[10:00:05] ERROR application-server resource exhaustion detected; request queue latency rising

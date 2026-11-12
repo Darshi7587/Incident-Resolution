@@ -1,0 +1,4 @@
+[12:00:01] ERROR payment-api unavailable (HTTP 503 Service Unavailable)
+[12:00:02] ERROR payment-api Connection refused while connecting to db-server:5432
+[12:00:03] ERROR db-server Database connection failed: connection pool exhausted
+[12:00:04] CRITICAL payment-api SERVICE_FAILURE healthcheck failed

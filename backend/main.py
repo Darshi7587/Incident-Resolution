@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import get_settings
 from backend.database.db import check_db_connection, init_db
+from backend.routes.incidents import router as incidents_router
 from backend.schemas.common import HealthResponse
 
 
@@ -61,6 +62,7 @@ def create_app() -> FastAPI:
             },
         )
 
+    app.include_router(incidents_router)
     return app
 
 

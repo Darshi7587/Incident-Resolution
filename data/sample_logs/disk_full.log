@@ -1,0 +1,4 @@
+[11:00:01] WARNING storage-service Disk utilization: 85% on /dev/sda1
+[11:00:02] CRITICAL storage-service Disk utilization: 96% (2 GB available on /dev/sda1)
+[11:00:03] ERROR storage-service DISK_SPACE_CRITICAL on /dev/sda1
+[11:00:04] ERROR storage-service Temporary storage threshold exceeded (42 GB in /var/tmp/sim-cache)
